@@ -189,8 +189,8 @@ github.com/mattn/go-isatty v0.0.19 h1:JITubQf0MOLdlGRuRq+jtsDlekdYPia9ZFsB8h/APP
 github.com/mattn/go-isatty v0.0.19/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/mattn/go-runewidth v0.0.17 h1:78v8ZlW0bP43XfmAfPsdXcoNCelfMHsDmd/pkENfrjQ=
 github.com/mattn/go-runewidth v0.0.17/go.mod h1:Jdepj2loyihRzMpdS35Xk/zdY8IAYHsh153qUoGf23w=
-github.com/mekza/karpenter v1.15.1-0.20261124000256-e63304bd459f h1:brfXpWRLtr3c04x+cKwzvJReJZHvmrVpqBIGzNlJiQM=
-github.com/mekza/karpenter v1.15.1-0.20261124000256-e63304bd459f/go.mod h1:QJWGWb2tfh3zStcPftf6lQn7eq6gQGaV8i/yMEEflDU=
+github.com/mekza/karpenter v1.15.1-0.20261124120429-550e90505601 h1:qD1W9FDxAjQnSBpyIRGFqB+au8I7tItaL2iMrcd5apk=
+github.com/mekza/karpenter v1.15.1-0.20261124120429-550e90505601/go.mod h1:QJWGWb2tfh3zStcPftf6lQn7eq6gQGaV8i/yMEEflDU=
 github.com/mfridman/tparse v0.18.0 h1:wh6dzOKaIwkUGyKgOntDW4liXSo37qg5AXbIhkMV3vE=
 github.com/mfridman/tparse v0.18.0/go.mod h1:gEvqZTuCgEhPbYk/2lS3Kcxg1GmTxxU7kTC8DvP0i/A=
 github.com/mitchellh/go-homedir v1.1.0 h1:lukF9ziXFxDFPkA1vsr5zpc1XuPDn/wFntq5mG+4E0Y=

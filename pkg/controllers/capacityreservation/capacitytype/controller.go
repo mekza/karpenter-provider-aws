@@ -58,6 +58,68 @@ func (*Controller) Name() string {
 	return "capacityreservation.capacitytype"
 }
 
+// promote relabels an on-demand NodeClaim, and its Node, whose instance now runs in a capacity reservation. This happens
+// when a migration into a reservation that turned out to be full was given up on, and the instance joined the
+// reservation later. The labels must match where the instance runs, regardless of the pods bound to the node.
+func (c *Controller) promote(ctx context.Context, cpNC *karpv1.NodeClaim, nc *karpv1.NodeClaim) (bool, error) {
+	reservationID := cpNC.Labels[cloudprovider.ReservationIDLabel]
+	if nc.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand || reservationID == "" {
+		return false, nil
+	}
+	// The capacity type was listed before the NodeClaim; confirm against EC2 before promoting.
+	id, err := utils.ParseInstanceID(nc.Status.ProviderID)
+	if err != nil {
+		return false, serrors.Wrap(fmt.Errorf("parsing instance id, %w", err), "NodeClaim", klog.KObj(nc))
+	}
+	current, err := c.instanceProvider.Get(ctx, id, instance.SkipCache)
+	if err != nil {
+		return false, cloudprovider.IgnoreNodeClaimNotFoundError(serrors.Wrap(fmt.Errorf("getting instance, %w", err), "NodeClaim", klog.KObj(nc)))
+	}
+	if current.CapacityReservationDetails == nil || current.CapacityReservationDetails.ID != reservationID {
+		return false, nil
+	}
+	relabel := func(labels map[string]string) map[string]string {
+		labels = lo.Assign(labels, map[string]string{karpv1.CapacityTypeLabelKey: karpv1.CapacityTypeReserved})
+		for label := range cloudprovider.ReservedCapacityLabels {
+			if value, ok := cpNC.Labels[label]; ok {
+				labels[label] = value
+			} else {
+				delete(labels, label)
+			}
+		}
+		return labels
+	}
+	stored := nc.DeepCopy()
+	nc.Labels = relabel(nc.Labels)
+	if err := c.kubeClient.Patch(ctx, nc, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
+		return false, serrors.Wrap(fmt.Errorf("patching nodeclaim, %w", err), "NodeClaim", klog.KObj(nc))
+	}
+	if err := c.promoteNodes(ctx, nc, relabel); err != nil {
+		return false, err
+	}
+	log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nc), "capacity-reservation-id", reservationID).Info("promoted nodeclaim to reserved, its instance joined a capacity reservation")
+	return true, nil
+}
+
+// promoteNodes relabels the registered on-demand Nodes of the NodeClaim.
+func (c *Controller) promoteNodes(ctx context.Context, nc *karpv1.NodeClaim, relabel func(map[string]string) map[string]string) error {
+	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nc)
+	if err != nil {
+		return serrors.Wrap(fmt.Errorf("listing nodes for nodeclaim, %w", err), "NodeClaim", klog.KObj(nc))
+	}
+	for _, n := range nodes {
+		if !n.DeletionTimestamp.IsZero() || n.Labels[karpv1.NodeRegisteredLabelKey] != "true" || n.Labels[karpv1.CapacityTypeLabelKey] != karpv1.CapacityTypeOnDemand {
+			continue
+		}
+		stored := n.DeepCopy()
+		n.Labels = relabel(n.Labels)
+		if err := c.kubeClient.Patch(ctx, n, client.MergeFrom(stored)); client.IgnoreNotFound(err) != nil {
+			return serrors.Wrap(fmt.Errorf("patching node, %w", err), "Node", klog.KObj(n))
+		}
+	}
+	return nil
+}
+
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
@@ -85,7 +147,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		if !ok {
 			continue
 		}
-		updated, err := c.syncCapacityType(ctx, cpNC.Labels[karpv1.CapacityTypeLabelKey], &ncs.Items[i])
+		updated, err := c.syncCapacityType(ctx, cpNC, &ncs.Items[i])
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -108,22 +170,24 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 }
 
 // syncCapacityType will update the capacity type for the given NodeClaim. This accounts for the fact that capacity
-// reservations will expire, demoting NodeClaims with capacity type "reserved" to "on-demand".
+// reservations will expire, demoting NodeClaims with capacity type "reserved" to "on-demand", and that an on-demand
+// instance that targets a full reservation joins it once capacity frees up, promoting its NodeClaim to "reserved".
 //
 //nolint:gocyclo
-func (c *Controller) syncCapacityType(ctx context.Context, capacityType string, nc *karpv1.NodeClaim) (bool, error) {
+func (c *Controller) syncCapacityType(ctx context.Context, cpNC *karpv1.NodeClaim, nc *karpv1.NodeClaim) (bool, error) {
 	// We won't be able to sync deleting NodeClaims, and there's no real need to either as they're already draining.
 	if !nc.DeletionTimestamp.IsZero() {
 		return false, nil
 	}
-
-	// For now we only account for the case where a reserved NodeClaim becomes an on-demand NodeClaim. This does not
-	// account for on-demand NodeClaims being promoted to reserved since that is not natively supported by Karpenter.
-	if capacityType != karpv1.CapacityTypeOnDemand {
-		return false, nil
-	}
 	// A NodeClaim moving into a capacity reservation is relabeled by the reservation migration controller.
 	if nc.Annotations[karpv1.ReservationMigrationTargetAnnotationKey] != "" {
+		return false, nil
+	}
+	capacityType := cpNC.Labels[karpv1.CapacityTypeLabelKey]
+	if capacityType == karpv1.CapacityTypeReserved {
+		return c.promote(ctx, cpNC, nc)
+	}
+	if capacityType != karpv1.CapacityTypeOnDemand {
 		return false, nil
 	}
 	// The capacity type was listed before the NodeClaim, so a NodeClaim that moved into a reservation in between would

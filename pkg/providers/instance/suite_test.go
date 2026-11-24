@@ -1205,8 +1205,17 @@ var _ = Describe("InstanceProvider", func() {
 			awsEnv.EC2API.Instances.Store(aws.ToString(ec2Instance.InstanceId), ec2Instance)
 			return aws.ToString(ec2Instance.InstanceId)
 		}
+		// reservations sets the reservations EC2 describes, with their state and free capacity.
+		reservations := func(crs ...ec2types.CapacityReservation) {
+			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: crs})
+		}
+		reservation := func(id string, state ec2types.CapacityReservationState, available int32) ec2types.CapacityReservation {
+			return ec2types.CapacityReservation{CapacityReservationId: aws.String(id), OwnerId: aws.String("012345678901"), State: state, AvailableInstanceCount: aws.Int32(available)}
+		}
 		BeforeEach(func() {
 			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount(reservationID, 2)
+			reservations(reservation(reservationID, ec2types.CapacityReservationStateActive, 2))
+			DeferCleanup(awsEnv.EC2API.DescribeCapacityReservationsOutput.Reset)
 		})
 		It("should target the reservation and report the instance as reserved", func() {
 			id := onDemandInstance()
@@ -1236,7 +1245,65 @@ var _ = Describe("InstanceProvider", func() {
 			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(1))
 			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(1))
 		})
+		DescribeTable("should reject a reservation without free capacity without targeting it",
+			func(state ec2types.CapacityReservationState, available int32) {
+				reservations(reservation(reservationID, state, available))
+				id := onDemandInstance()
+				err := awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)
+				Expect(corecloudprovider.IsReservationMigrationRejectedError(err)).To(BeTrue())
+				Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(0))
+			},
+			Entry("when it is full", ec2types.CapacityReservationStateActive, int32(0)),
+			Entry("when it was canceled", ec2types.CapacityReservationStateCancelled, int32(1)),
+			Entry("when it expired", ec2types.CapacityReservationStateExpired, int32(1)),
+		)
+		It("should reject a reservation EC2 doesn't describe", func() {
+			reservations()
+			err := awsEnv.InstanceProvider.MigrateToReservation(ctx, onDemandInstance(), reservationID)
+			Expect(corecloudprovider.IsReservationMigrationRejectedError(err)).To(BeTrue())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(0))
+		})
+		It("should stop offering a full reservation it found", func() {
+			reservations(reservation(reservationID, ec2types.CapacityReservationStateActive, 0))
+			Expect(awsEnv.InstanceProvider.MigrateToReservation(ctx, onDemandInstance(), reservationID)).ToNot(Succeed())
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(0))
+		})
+		It("should accept, but not request again, a migration into a reservation that filled up since it was checked", func() {
+			// EC2 accepts targeting a full reservation; the instance only joins it once capacity frees up
+			awsEnv.EC2API.FullCapacityReservations.Store(reservationID, true)
+			id := onDemandInstance()
+			Expect(awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)).To(Succeed())
+			inst, err := awsEnv.InstanceProvider.Get(ctx, id)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(inst.CapacityType).To(Equal(karpv1.CapacityTypeOnDemand))
+			Expect(inst.CapacityReservationTargetID).To(Equal(reservationID))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(0))
+
+			err = awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)
+			Expect(corecloudprovider.IsNodeClaimNotMigratableError(err)).To(BeTrue())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(1))
+		})
+		It("should not retarget an instance that waits for capacity in another active reservation", func() {
+			reservations(
+				reservation(reservationID, ec2types.CapacityReservationStateActive, 2),
+				reservation("cr-waiting", ec2types.CapacityReservationStateActive, 0),
+			)
+			ec2Instance := test.EC2Instance(ec2types.Instance{
+				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: aws.String("cr-waiting")},
+				},
+			})
+			id := aws.ToString(ec2Instance.InstanceId)
+			awsEnv.EC2API.Instances.Store(id, ec2Instance)
+			err := awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)
+			Expect(corecloudprovider.IsNodeClaimNotMigratableError(err)).To(BeTrue())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(0))
+		})
 		It("should move an instance whose reservation is no longer active", func() {
+			reservations(
+				reservation(reservationID, ec2types.CapacityReservationStateActive, 2),
+				reservation("cr-expired", ec2types.CapacityReservationStateCancelled, 0),
+			)
 			// e.g. an instance launched into a reservation that since expired, and was demoted to on-demand
 			ec2Instance := test.EC2Instance(ec2types.Instance{
 				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{

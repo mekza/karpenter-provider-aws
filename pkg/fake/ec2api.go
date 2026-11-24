@@ -78,6 +78,9 @@ type EC2Behavior struct {
 	launchTemplatesToCapacityReservations sync.Map // map[lt-name]cr-id
 
 	ModifyInstanceCapacityReservationAttributesBehavior MockedFunction[ec2.ModifyInstanceCapacityReservationAttributesInput, ec2.ModifyInstanceCapacityReservationAttributesOutput]
+	// FullCapacityReservations holds IDs of reservations that ModifyInstanceCapacityReservationAttributes treats as
+	// full, regardless of DescribeCapacityReservationsOutput, modeling a reservation that filled up after it was described
+	FullCapacityReservations sync.Map
 }
 
 type EC2API struct {
@@ -108,6 +111,7 @@ func (e *EC2API) Reset() {
 	e.TerminateInstancesBehavior.Reset()
 	e.RebootInstancesBehavior.Reset()
 	e.ModifyInstanceCapacityReservationAttributesBehavior.Reset()
+	e.FullCapacityReservations.Clear()
 	e.DescribeInstancesBehavior.Reset()
 	e.CreateLaunchTemplateBehavior.Reset()
 	e.CalledWithDescribeImagesInput.Reset()
@@ -283,22 +287,59 @@ func (e *EC2API) RebootInstances(_ context.Context, input *ec2.RebootInstancesIn
 	})
 }
 
-// ModifyInstanceCapacityReservationAttributes moves the stored instance into the targeted capacity reservation, the way
-// EC2 moves a running instance whose capacity reservation preference is none.
+// ModifyInstanceCapacityReservationAttributes models how EC2 retargets a running instance, as observed against EC2:
+//   - only an instance with a capacity reservation preference of none, or that targets the same or an inactive
+//     reservation, can be retargeted, otherwise EC2 fails with IncorrectInstanceState,
+//   - targeting a reservation with free capacity moves the instance into it,
+//   - targeting a full reservation succeeds, but the instance only targets it, and joins it once capacity frees up.
+//
+// Reservations are looked up in DescribeCapacityReservationsOutput; reservations missing from it are treated as active
+// with free capacity.
+//
+//nolint:gocyclo
 func (e *EC2API) ModifyInstanceCapacityReservationAttributes(_ context.Context, input *ec2.ModifyInstanceCapacityReservationAttributesInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
 	return e.ModifyInstanceCapacityReservationAttributesBehavior.Invoke(input, func(input *ec2.ModifyInstanceCapacityReservationAttributesInput) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
 		raw, ok := e.Instances.Load(lo.FromPtr(input.InstanceId))
 		if !ok {
-			return nil, &smithy.GenericAPIError{Code: "InvalidInstanceID.NotFound", Message: "The instance ID does not exist"}
+			return nil, &smithy.GenericAPIError{Code: "InvalidInstanceID.NotFound", Message: "The instance ID does not exist", Fault: smithy.FaultClient}
 		}
 		instance := raw.(ec2types.Instance)
 		target := input.CapacityReservationSpecification.CapacityReservationTarget
 		if target == nil || target.CapacityReservationId == nil {
-			return nil, &smithy.GenericAPIError{Code: "InvalidParameterCombination", Message: "A capacity reservation target is required"}
+			return nil, &smithy.GenericAPIError{Code: "InvalidParameterCombination", Message: "A capacity reservation target is required", Fault: smithy.FaultClient}
 		}
-		instance.CapacityReservationId = target.CapacityReservationId
+		reservation := func(id string) (ec2types.CapacityReservation, bool) {
+			if e.DescribeCapacityReservationsOutput.IsNil() {
+				return ec2types.CapacityReservation{}, false
+			}
+			return lo.Find(e.DescribeCapacityReservationsOutput.Clone().CapacityReservations, func(cr ec2types.CapacityReservation) bool {
+				return lo.FromPtr(cr.CapacityReservationId) == id
+			})
+		}
+		var currentTarget string
+		var currentPreference ec2types.CapacityReservationPreference
+		if spec := instance.CapacityReservationSpecification; spec != nil {
+			currentPreference = spec.CapacityReservationPreference
+			if spec.CapacityReservationTarget != nil {
+				currentTarget = lo.FromPtr(spec.CapacityReservationTarget.CapacityReservationId)
+			}
+		}
+		modifiable := lo.Ternary(currentTarget == "", currentPreference == ec2types.CapacityReservationPreferenceNone, func() bool {
+			cr, found := reservation(currentTarget)
+			return currentTarget == *target.CapacityReservationId || !found || cr.State != ec2types.CapacityReservationStateActive
+		}())
+		if !modifiable {
+			return nil, &smithy.GenericAPIError{Code: "IncorrectInstanceState", Message: "The instance is in an invalid state for this operation", Fault: smithy.FaultClient}
+		}
 		instance.CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
 			CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: target.CapacityReservationId},
+		}
+		_, full := e.FullCapacityReservations.Load(*target.CapacityReservationId)
+		if cr, found := reservation(*target.CapacityReservationId); lo.FromPtr(instance.CapacityReservationId) == *target.CapacityReservationId ||
+			(!full && (!found || lo.FromPtr(cr.AvailableInstanceCount) > 0)) {
+			instance.CapacityReservationId = target.CapacityReservationId
+		} else {
+			instance.CapacityReservationId = nil
 		}
 		e.Instances.Swap(lo.FromPtr(instance.InstanceId), instance)
 		return &ec2.ModifyInstanceCapacityReservationAttributesOutput{Return: lo.ToPtr(true)}, nil

@@ -356,11 +356,16 @@ func (p *DefaultProvider) Reboot(ctx context.Context, id string, operationID str
 }
 
 // MigrateToReservation moves the running instance into the capacity reservation in place, by targeting the reservation
-// with ec2:ModifyInstanceCapacityReservationAttributes. EC2 only moves a running instance into a reservation when its
-// capacity reservation preference is none, which is how Karpenter launches on-demand instances when reserved capacity is
-// enabled, or when it targets a reservation that is no longer active, as instances Karpenter launched into a reservation
-// that since expired or was canceled do. Targeting the reservation is what makes the call idempotent: once the
-// instance targets it, the move was accepted and isn't requested again.
+// with ec2:ModifyInstanceCapacityReservationAttributes. It returns nil once the instance runs in the reservation, or
+// targets it while waiting for capacity right after this request.
+//
+// EC2 only retargets a running instance whose capacity reservation preference is none, which is how Karpenter launches
+// on-demand instances when reserved capacity is enabled, or that targets a reservation that is no longer active, as
+// instances Karpenter launched into a reservation that since expired or was canceled do. Retargeting is irreversible:
+// an instance that targets an active reservation can't be retargeted. If that reservation is full, EC2 still accepts
+// the request, and the instance joins the reservation once capacity frees up. So the reservation's free capacity is
+// checked right before the request. Once the instance targets the reservation without running in it, it isn't
+// requested again: the capacity type controller promotes the NodeClaim once the instance joins the reservation.
 func (p *DefaultProvider) MigrateToReservation(ctx context.Context, id string, reservationID string) error {
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("id", id, "reservation-id", reservationID))
 	instance, err := p.Get(ctx, id, SkipCache)
@@ -368,13 +373,21 @@ func (p *DefaultProvider) MigrateToReservation(ctx context.Context, id string, r
 		return err
 	}
 	if instance.CapacityReservationTargetID == reservationID {
-		return nil
+		if instance.CapacityReservationDetails != nil && instance.CapacityReservationDetails.ID == reservationID {
+			return nil
+		}
+		// An earlier request targeted the reservation while it was full. The instance joins it once capacity frees up,
+		// and can't be retargeted until then.
+		return cloudprovider.NewNodeClaimNotMigratableError(fmt.Errorf("instance %s targets capacity reservation %s, and joins it once it has capacity", id, reservationID))
 	}
 	// Avoid mutating instances during zonal shift
 	if instance.ZoneID != "" && p.zonalshiftProvider.IsZonalShifted(ctx, instance.ZoneID) {
 		return fmt.Errorf("instance %s is in zonally shifted availability zone %s (%s), skipping capacity reservation migration", id, instance.Zone, instance.ZoneID)
 	}
-	if err := migratable(instance); err != nil {
+	if err := p.migratable(ctx, instance); err != nil {
+		return err
+	}
+	if err := p.reservationHasCapacity(ctx, reservationID); err != nil {
 		return err
 	}
 	_, err = p.ec2api.ModifyInstanceCapacityReservationAttributes(ctx, &ec2.ModifyInstanceCapacityReservationAttributesInput{
@@ -383,30 +396,91 @@ func (p *DefaultProvider) MigrateToReservation(ctx context.Context, id string, r
 			CapacityReservationTarget: &ec2types.CapacityReservationTarget{CapacityReservationId: aws.String(reservationID)},
 		},
 	})
+	return p.migrationOutcome(ctx, id, reservationID, err)
+}
+
+// migrationOutcome refreshes the instance after a request to move it into the reservation, and returns the outcome of
+// the request, which returned err.
+func (p *DefaultProvider) migrationOutcome(ctx context.Context, id string, reservationID string, err error) error {
 	// Refresh the cached instance either way, so Get reports whether it moved. If the refresh fails, evict the instance
 	// so the next Get reads it from EC2.
 	refreshed, getErr := p.Get(ctx, id, SkipCache)
 	if getErr != nil {
 		p.instanceCache.Delete(id)
+		if err != nil {
+			return p.migrationError(reservationID, err)
+		}
+		// EC2 accepted the request, the next Get reports where the instance runs.
+		return nil
 	}
-	// The request may have been applied even though it failed.
-	if err != nil && (getErr != nil || refreshed.CapacityReservationTargetID != reservationID) {
+	switch {
+	case refreshed.CapacityReservationDetails != nil && refreshed.CapacityReservationDetails.ID == reservationID:
+		// The request may have been applied even though it failed.
+		p.capacityReservationProvider.MarkLaunched(reservationID)
+		return nil
+	case refreshed.CapacityReservationTargetID == reservationID:
+		// The instance targets the reservation but doesn't run in it: the reservation filled up since it was checked, and
+		// the instance joins it once capacity frees up.
+		log.FromContext(ctx).Info("instance is waiting for capacity in the capacity reservation it now targets")
+		p.capacityReservationProvider.SetAvailableInstanceCount(reservationID, 0)
+		return nil
+	case err != nil:
 		return p.migrationError(reservationID, err)
+	default:
+		return fmt.Errorf("instance %s doesn't target capacity reservation %s after the request succeeded", id, reservationID)
 	}
-	p.capacityReservationProvider.MarkLaunched(reservationID)
-	return nil
 }
 
-// migratable returns a NodeClaimNotMigratableError if EC2 can't move the running instance into a reservation.
-func migratable(instance *Instance) error {
+// migratable returns a NodeClaimNotMigratableError if EC2 won't retarget the running instance.
+func (p *DefaultProvider) migratable(ctx context.Context, instance *Instance) error {
 	if instance.CapacityType != karpv1.CapacityTypeOnDemand {
 		return cloudprovider.NewNodeClaimNotMigratableError(fmt.Errorf("instance %s has capacity type %q, but only on-demand instances can move into a capacity reservation", instance.ID, instance.CapacityType))
 	}
-	// An on-demand instance that targets a reservation doesn't run in it, so the reservation is no longer active.
-	if instance.CapacityReservationTargetID == "" && instance.CapacityReservationPreference != ec2types.CapacityReservationPreferenceNone {
-		return cloudprovider.NewNodeClaimNotMigratableError(fmt.Errorf("instance %s has capacity reservation preference %q, "+
-			"but only running instances with preference %q, or that target an inactive reservation, can move into a capacity reservation",
-			instance.ID, instance.CapacityReservationPreference, ec2types.CapacityReservationPreferenceNone))
+	if instance.CapacityReservationTargetID == "" {
+		if instance.CapacityReservationPreference != ec2types.CapacityReservationPreferenceNone {
+			return cloudprovider.NewNodeClaimNotMigratableError(fmt.Errorf("instance %s has capacity reservation preference %q, "+
+				"but only running instances with preference %q, or that target an inactive reservation, can move into a capacity reservation",
+				instance.ID, instance.CapacityReservationPreference, ec2types.CapacityReservationPreferenceNone))
+		}
+		return nil
+	}
+	// The instance targets a reservation it doesn't run in. EC2 only retargets it if that reservation is no longer
+	// active; while it is, the instance is waiting to join it.
+	out, err := p.ec2api.DescribeCapacityReservations(ctx, &ec2.DescribeCapacityReservationsInput{CapacityReservationIds: []string{instance.CapacityReservationTargetID}})
+	if err != nil {
+		if awserrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("describing targeted capacity reservation, %w", err)
+	}
+	if cr, ok := lo.Find(out.CapacityReservations, func(cr ec2types.CapacityReservation) bool {
+		return aws.ToString(cr.CapacityReservationId) == instance.CapacityReservationTargetID
+	}); ok && (cr.State == ec2types.CapacityReservationStateActive || cr.State == ec2types.CapacityReservationStatePending) {
+		return cloudprovider.NewNodeClaimNotMigratableError(fmt.Errorf("instance %s targets active capacity reservation %s, and joins it once it has capacity", instance.ID, instance.CapacityReservationTargetID))
+	}
+	return nil
+}
+
+// reservationHasCapacity returns a ReservationMigrationRejectedError unless the reservation is active and has free
+// capacity, since EC2 accepts targeting a full reservation and the instance can't be retargeted afterwards.
+func (p *DefaultProvider) reservationHasCapacity(ctx context.Context, reservationID string) error {
+	out, err := p.ec2api.DescribeCapacityReservations(ctx, &ec2.DescribeCapacityReservationsInput{CapacityReservationIds: []string{reservationID}})
+	if err != nil {
+		if awserrors.IsNotFound(err) {
+			return cloudprovider.NewReservationMigrationRejectedError(fmt.Errorf("capacity reservation %s doesn't exist, %w", reservationID, err))
+		}
+		return fmt.Errorf("describing capacity reservation, %w", err)
+	}
+	cr, ok := lo.Find(out.CapacityReservations, func(cr ec2types.CapacityReservation) bool {
+		return aws.ToString(cr.CapacityReservationId) == reservationID
+	})
+	if !ok || cr.State != ec2types.CapacityReservationStateActive {
+		return cloudprovider.NewReservationMigrationRejectedError(fmt.Errorf("capacity reservation %s isn't active", reservationID))
+	}
+	available := int(aws.ToInt32(cr.AvailableInstanceCount))
+	p.capacityReservationProvider.SetAvailableInstanceCount(reservationID, available)
+	if available < 1 {
+		return cloudprovider.NewReservationMigrationRejectedError(fmt.Errorf("capacity reservation %s is full", reservationID))
 	}
 	return nil
 }

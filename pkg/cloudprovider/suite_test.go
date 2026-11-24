@@ -588,6 +588,10 @@ var _ = Describe("CloudProvider", func() {
 			})}
 		}
 		It("should move the instance into the reservation and report it with the reserved labels", func() {
+			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{CapacityReservations: []ec2types.CapacityReservation{{
+				CapacityReservationId: aws.String("cr-migration"), OwnerId: aws.String("012345678901"), State: ec2types.CapacityReservationStateActive, AvailableInstanceCount: aws.Int32(1),
+			}}})
+			DeferCleanup(awsEnv.EC2API.DescribeCapacityReservationsOutput.Reset)
 			instance := test.EC2Instance(ec2types.Instance{
 				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{CapacityReservationPreference: ec2types.CapacityReservationPreferenceNone},
 			})
