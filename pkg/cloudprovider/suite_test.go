@@ -580,6 +580,46 @@ var _ = Describe("CloudProvider", func() {
 			Expect(evaluate(corev1.NodeDiskPressure, corev1.ConditionTrue, "", time.Hour).Action).To(BeEmpty())
 		})
 	})
+	Context("MigrateToReservation", func() {
+		reservedOffering := func(id string) *corecloudprovider.Offering {
+			return &corecloudprovider.Offering{Requirements: scheduling.NewLabelRequirements(map[string]string{
+				karpv1.CapacityTypeLabelKey:   karpv1.CapacityTypeReserved,
+				v1.LabelCapacityReservationID: id,
+			})}
+		}
+		It("should move the instance into the reservation and report it with the reserved labels", func() {
+			instance := test.EC2Instance(ec2types.Instance{
+				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{CapacityReservationPreference: ec2types.CapacityReservationPreferenceNone},
+			})
+			id := aws.ToString(instance.InstanceId)
+			awsEnv.EC2API.Instances.Store(id, instance)
+			nodeClaim.Status.ProviderID = fake.ProviderID(id)
+			Expect(cloudProvider.MigrateToReservation(ctx, nodeClaim, reservedOffering("cr-migration"))).To(Succeed())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(1))
+
+			cpNodeClaim, err := cloudProvider.Get(ctx, nodeClaim.Status.ProviderID)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(cpNodeClaim.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+			Expect(cpNodeClaim.Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationID, "cr-migration"))
+			Expect(cpNodeClaim.Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationType, string(v1.CapacityReservationTypeDefault)))
+			Expect(cpNodeClaim.Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationInterruptible, "false"))
+		})
+		It("should reject offerings that aren't capacity reservations", func() {
+			instance := test.EC2Instance()
+			awsEnv.EC2API.Instances.Store(aws.ToString(instance.InstanceId), instance)
+			nodeClaim.Status.ProviderID = fake.ProviderID(aws.ToString(instance.InstanceId))
+			onDemand := &corecloudprovider.Offering{Requirements: scheduling.NewLabelRequirements(map[string]string{
+				karpv1.CapacityTypeLabelKey: karpv1.CapacityTypeOnDemand,
+			})}
+			Expect(cloudProvider.MigrateToReservation(ctx, nodeClaim, onDemand)).ToNot(Succeed())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(0))
+		})
+		It("should reject an invalid provider ID", func() {
+			nodeClaim.Status.ProviderID = "invalid"
+			Expect(cloudProvider.MigrateToReservation(ctx, nodeClaim, reservedOffering("cr-migration"))).ToNot(Succeed())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(0))
+		})
+	})
 	Context("Reboot", func() {
 		It("should reboot the instance via ec2:RebootInstances", func() {
 			instance := test.EC2Instance()

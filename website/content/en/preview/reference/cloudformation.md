@@ -291,6 +291,40 @@ The AllowScopedDeletion Sid allows [TerminateInstances](https://docs.aws.amazon.
 }
 ```
 
+#### AllowScopedCapacityReservationMigration
+
+The AllowScopedCapacityReservationMigration Sid allows [ModifyInstanceCapacityReservationAttributes](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceCapacityReservationAttributes.html) on instances, provided that `karpenter.sh/nodepool` and `kubernetes.io/cluster/${ClusterName}` tags are set. Karpenter uses it to [move a running on-demand node into an On-Demand Capacity Reservation]({{<ref "../concepts/nodeclasses#speccapacityreservationselectorterms" >}}) in place (only with the `ReservedCapacityMigration` feature gate enabled), so it can only modify instances that are associated with it.
+
+```json
+{
+  "Sid": "AllowScopedCapacityReservationMigration",
+  "Effect": "Allow",
+  "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:*:instance/*",
+  "Action": "ec2:ModifyInstanceCapacityReservationAttributes",
+  "Condition": {
+    "StringEquals": {
+      "aws:ResourceTag/kubernetes.io/cluster/${ClusterName}": "owned"
+    },
+    "StringLike": {
+      "aws:ResourceTag/karpenter.sh/nodepool": "*"
+    }
+  }
+}
+```
+
+#### AllowCapacityReservationMigrationTargets
+
+The AllowCapacityReservationMigrationTargets Sid allows [ModifyInstanceCapacityReservationAttributes](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceCapacityReservationAttributes.html) to target capacity reservations. Capacity reservations aren't tagged by Karpenter, so this can't be scoped by the tags of AllowScopedCapacityReservationMigration. Karpenter only targets the reservations selected by an EC2NodeClass's `capacityReservationSelectorTerms`.
+
+```json
+{
+  "Sid": "AllowCapacityReservationMigrationTargets",
+  "Effect": "Allow",
+  "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:*:capacity-reservation/*",
+  "Action": "ec2:ModifyInstanceCapacityReservationAttributes"
+}
+```
+
 ### KarpenterControllerIAMIntegrationPolicy
 
 The `IAMIntegrationPolicy` manages IAM instance profile operations. Given a cluster name of `bob-karpenter-demo`, this policy would be named: `KarpenterControllerIAMIntegrationPolicy-bob-karpenter-demo`

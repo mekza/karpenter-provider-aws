@@ -79,6 +79,35 @@ Karpenter will prioritize ODCRs, but if none are available or none are compatibl
 Similarly, Karpenter will prioritize reserved capacity during consolidation.
 Since ODCRs are pre-paid, Karpenter will model them as free and consolidate spot / on-demand nodes when possible.
 
+## Migrating On-Demand Nodes into Reservations
+
+<i class="fa-solid fa-circle-info"></i> <b>Feature State: </b> [Alpha]({{<ref "../reference/settings#feature-gates" >}})
+
+When an ODCR gains free capacity, for example because nodes in it were consolidated away or the reservation was created or extended, on-demand nodes that could run in it keep running as on-demand.
+Consolidation can replace them with new nodes in the reservation, but that launches new instances and evicts their pods.
+With the `ReservedCapacityMigration` [feature gate]({{<ref "../reference/settings#feature-gates" >}}) (Helm: `settings.featureGates.reservedCapacityMigration`), Karpenter instead moves the running on-demand instance into the reservation in place, using EC2's [support for modifying the Capacity Reservation settings of a running instance](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-reservations-modify-instance.html).
+The instance isn't stopped or replaced, and its pods keep running.
+
+Karpenter migrates an on-demand node into a reservation selected by its EC2NodeClass when all of the following are true:
+
+* The reservation is an active, non-interruptible On-Demand Capacity Reservation (not a Capacity Block) for the node's instance type and Availability Zone, and has free capacity.
+* The node's NodePool allows the `reserved` capacity type and the reservation, so the migrated node isn't drifted.
+* Every pod on the node, including DaemonSet pods, still matches the node on its node selector and required node affinity once the node is relabeled as reserved, no DaemonSet that doesn't run on the node today would select it afterwards, and no pod uses `karpenter.sh/capacity-type` or a `karpenter.k8s.aws/capacity-reservation-*` label as the topology key of a required pod affinity, pod anti-affinity, or `DoNotSchedule` topology spread constraint involving the node.
+* The node is initialized and isn't being disrupted, deleted, rebooted, nominated for pending pods, or annotated with `karpenter.sh/do-not-disrupt: "true"`.
+* The instance was launched with a capacity reservation preference of `none`, which Karpenter sets on every on-demand instance it launches while the `ReservedCapacity` feature gate is enabled, or it targets a reservation that is no longer active, like a node Karpenter launched into an ODCR that since expired or was cancelled. EC2 can't move running instances launched with the default `open` preference.
+
+To migrate a node, Karpenter taints it with `karpenter.sh/reservation-migration:NoSchedule` so no new pods schedule against its on-demand labels, waits for in-flight pod bindings to settle, and checks the node's pods again.
+It then records the target reservation in the NodeClaim's `karpenter.sh/reservation-migration-target` annotation, moves the instance into the reservation, relabels the NodeClaim and Node with `karpenter.sh/capacity-type: reserved` and the reservation's `karpenter.k8s.aws/capacity-reservation-*` labels, and removes the taint.
+Karpenter migrates at most 10 nodes at a time, and never more nodes into a reservation than it has free capacity.
+Karpenter checks the node's pods one last time right before it asks EC2 to move the instance. Pods that tolerate the `karpenter.sh/reservation-migration` taint, or are bound with `spec.nodeName`, can still land on the node in the seconds between that request and the relabel, so Karpenter relabels the node regardless and emits a `ReservationMigrationMismatched` warning event if they don't match its new labels.
+If EC2 doesn't accept the request within 5 minutes, or accepts it but the instance isn't reported in the reservation within 30 minutes, Karpenter abandons the migration and removes the taint.
+
+Karpenter treats an instance that explicitly targets the reservation it runs in as `reserved`, including instances moved into a reservation outside of Karpenter. If you disable the feature gate, in-flight migrations still complete. If you downgrade to a version of Karpenter without this feature while a migration is in flight, remove the `karpenter.sh/reservation-migration` taint and the `karpenter.sh/reservation-migration-target` annotation yourself.
+
+{{% alert title="Note" color="primary" %}}
+Migrating nodes requires the [ec2:ModifyInstanceCapacityReservationAttributes](https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonec2.html#amazonec2-ModifyInstanceCapacityReservationAttributes) action on the instances Karpenter manages and on the reservations it targets. See the `AllowScopedCapacityReservationMigration` and `AllowCapacityReservationMigrationTargets` statements of the [controller policy]({{<ref "../reference/cloudformation#allowscopedcapacityreservationmigration" >}}).
+{{% /alert %}}
+
 ## Disrupting Nodes in Full Reservations
 
 For [Drift]({{<ref "../concepts/disruption#drift" >}}) and [Node Auto Repair]({{<ref "../concepts/disruption#node-auto-repair" >}}), Karpenter pre-spins a replacement before it terminates a node.

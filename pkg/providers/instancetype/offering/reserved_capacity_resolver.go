@@ -38,6 +38,15 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/providers/pricing"
 )
 
+// isMigratable returns whether running on-demand instances can move into the reservation in place. EC2 can move a
+// running on-demand instance into an active On-Demand Capacity Reservation, but not into a Capacity Block or an
+// interruptible reservation. Karpenter launches on-demand instances with a capacity reservation preference of none
+// whenever reserved offerings exist, which is what EC2 requires to move them.
+func isMigratable(reservation *v1.CapacityReservation) bool {
+	return reservation.ReservationType == v1.CapacityReservationTypeDefault && !reservation.Interruptible &&
+		reservation.State == v1.CapacityReservationStateActive
+}
+
 // ReservedCapacityResolver appends reserved capacity offerings for instance types
 // that match capacity reservations defined on the NodeClass.
 type ReservedCapacityResolver struct {
@@ -107,6 +116,7 @@ func (r *ReservedCapacityResolver) ResolveOfferings(
 			// and stays Compatible.
 			Compatible:          isCompatibleWithNodeClass,
 			ReservationCapacity: reservationCapacity,
+			Migratable:          isMigratable(reservation),
 		}
 		if zoneFound {
 			offering.Requirements.Add(scheduling.NewRequirement(v1.LabelTopologyZoneID, corev1.NodeSelectorOpIn, zonalInfo.ZoneID))

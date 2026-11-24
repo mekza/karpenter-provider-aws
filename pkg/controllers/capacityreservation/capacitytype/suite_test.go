@@ -68,7 +68,7 @@ var _ = BeforeSuite(func() {
 
 	cloudProvider := cloudprovider.New(awsEnv.InstanceTypesProvider, awsEnv.InstanceProvider, events.NewRecorder(&record.FakeRecorder{}),
 		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider, awsEnv.CapacityReservationProvider, awsEnv.PlacementGroupProvider, awsEnv.InstanceTypeStore, lo.ToPtr(""))
-	controller = capacitytype.NewController(env.Client, cloudProvider)
+	controller = capacitytype.NewController(env.Client, cloudProvider, awsEnv.InstanceProvider)
 })
 
 var _ = AfterSuite(func() {
@@ -148,6 +148,46 @@ var _ = Describe("Capacity Reservation Capacity Type Controller", func() {
 		Expect(node.Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
 		Expect(node.Labels).ToNot(HaveKey(corecloudprovider.ReservationIDLabel))
 		Expect(node.Labels).ToNot(HaveKey(v1.LabelCapacityReservationType))
+	})
+	It("should not demote a nodeclaim that moved into the reservation after the instances were listed", func() {
+		listed := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+		listed.Reservations[0].Instances[0].CapacityReservationId = nil
+		current := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+		current.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+			CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: &reservationID},
+		}
+		awsEnv.EC2API.DescribeInstancesBehavior.Output.Reset()
+		// MultiOut pops the last output first: the first describe serves the listing, the second the confirmation
+		// before demoting
+		awsEnv.EC2API.DescribeInstancesBehavior.MultiOut.Add(current)
+		awsEnv.EC2API.DescribeInstancesBehavior.MultiOut.Add(listed)
+
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectSingletonReconciled(ctx, controller)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+		Expect(ExpectExists(ctx, env.Client, node).Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+	})
+	It("should not demote a nodeclaim that is migrating into a reservation", func() {
+		out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+		out.Reservations[0].Instances[0].CapacityReservationId = nil
+		awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+		nodeClaim.Annotations = map[string]string{karpv1.ReservationMigrationTargetAnnotationKey: reservationID}
+
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectSingletonReconciled(ctx, controller)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+	})
+	It("should remove the interruptible label when demoting", func() {
+		nodeClaim.Labels[v1.LabelCapacityReservationInterruptible] = "false"
+		node.Labels[v1.LabelCapacityReservationInterruptible] = "false"
+		out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+		out.Reservations[0].Instances[0].CapacityReservationId = nil
+		awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
+
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectSingletonReconciled(ctx, controller)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Labels).ToNot(HaveKey(v1.LabelCapacityReservationInterruptible))
+		Expect(ExpectExists(ctx, env.Client, node).Labels).ToNot(HaveKey(v1.LabelCapacityReservationInterruptible))
 	})
 	It("should demote nodes from reserved to on-demand even if their nodeclaim was demoted previously", func() {
 		out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()

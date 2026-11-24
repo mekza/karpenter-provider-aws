@@ -51,6 +51,10 @@ type Instance struct {
 	CapacityReservationDetails *CapacityReservationDetails
 	Tenancy                    string
 	PartitionNumber            *int32
+	// CapacityReservationPreference and CapacityReservationTargetID are the instance's capacity reservation settings.
+	// They are only known for instances read from EC2, not for ones just launched.
+	CapacityReservationPreference ec2types.CapacityReservationPreference
+	CapacityReservationTargetID   string
 }
 
 type CapacityReservationDetails struct {
@@ -92,10 +96,27 @@ func NewInstance(ctx context.Context, instance ec2types.Instance) *Instance {
 			return item.InterfaceType != nil && (*item.InterfaceType == string(ec2types.NetworkInterfaceTypeEfa) ||
 				*item.InterfaceType == string(ec2types.NetworkInterfaceTypeEfaOnly))
 		}),
-		CapacityReservationDetails: capacityReservationDetails,
-		Tenancy:                    tenancyFromInstance(instance),
-		PartitionNumber:            partitionNumberFromInstance(instance),
+		CapacityReservationDetails:    capacityReservationDetails,
+		Tenancy:                       tenancyFromInstance(instance),
+		PartitionNumber:               partitionNumberFromInstance(instance),
+		CapacityReservationPreference: capacityReservationPreference(instance),
+		CapacityReservationTargetID:   capacityReservationTargetID(instance),
 	}
+}
+
+func capacityReservationPreference(instance ec2types.Instance) ec2types.CapacityReservationPreference {
+	if instance.CapacityReservationSpecification == nil {
+		return ""
+	}
+	return instance.CapacityReservationSpecification.CapacityReservationPreference
+}
+
+// capacityReservationTargetID returns the ID of the capacity reservation the instance explicitly targets, if any.
+func capacityReservationTargetID(instance ec2types.Instance) string {
+	if instance.CapacityReservationSpecification == nil || instance.CapacityReservationSpecification.CapacityReservationTarget == nil {
+		return ""
+	}
+	return lo.FromPtr(instance.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId)
 }
 
 func partitionNumberFromInstance(instance ec2types.Instance) *int32 {
@@ -114,9 +135,15 @@ func capacityTypeFromInstance(ctx context.Context, instance ec2types.Instance) s
 	if instance.SpotInstanceRequestId != nil {
 		return karpv1.CapacityTypeSpot
 	}
+	// An instance is reserved when it runs in a capacity reservation it can only run in, as Karpenter launches reserved
+	// instances, or that it explicitly targets, as Karpenter migrates running on-demand instances into reservations. An
+	// instance that merely landed in an open reservation it doesn't target stays on-demand, since treating it as reserved
+	// would induce drift.
 	if karpopts.FromContext(ctx).FeatureGates.ReservedCapacity &&
 		instance.CapacityReservationId != nil &&
-		instance.CapacityReservationSpecification.CapacityReservationPreference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly {
+		instance.CapacityReservationSpecification != nil &&
+		(instance.CapacityReservationSpecification.CapacityReservationPreference == ec2types.CapacityReservationPreferenceCapacityReservationsOnly ||
+			capacityReservationTargetID(instance) == *instance.CapacityReservationId) {
 		return karpv1.CapacityTypeReserved
 	}
 	return karpv1.CapacityTypeOnDemand

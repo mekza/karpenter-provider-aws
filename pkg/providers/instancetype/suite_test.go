@@ -3193,6 +3193,20 @@ var _ = Describe("InstanceTypeProvider", func() {
 			})
 			return offering
 		}
+		DescribeTable("should only allow migrating running instances into active, non-interruptible ODCRs",
+			func(reservationType v1.CapacityReservationType, interruptible bool, state v1.CapacityReservationState, migratable bool) {
+				nodeClass.Status.CapacityReservations[0].ReservationType = reservationType
+				nodeClass.Status.CapacityReservations[0].Interruptible = interruptible
+				nodeClass.Status.CapacityReservations[0].State = state
+				offering := resolveReservedOffering(crID)
+				Expect(offering).ToNot(BeNil())
+				Expect(offering.Migratable).To(Equal(migratable))
+			},
+			Entry("active ODCR", v1.CapacityReservationTypeDefault, false, v1.CapacityReservationStateActive, true),
+			Entry("expiring ODCR", v1.CapacityReservationTypeDefault, false, v1.CapacityReservationStateExpiring, false),
+			Entry("interruptible ODCR", v1.CapacityReservationTypeDefault, true, v1.CapacityReservationStateActive, false),
+			Entry("capacity block", v1.CapacityReservationTypeCapacityBlock, false, v1.CapacityReservationStateActive, false),
+		)
 		It("should decouple Available (health) from ReservationCapacity (slots) when the reservation is ICE'd", func() {
 			// Baseline: a healthy reservation resolves to Available with its configured capacity.
 			offering := resolveReservedOffering(crID)

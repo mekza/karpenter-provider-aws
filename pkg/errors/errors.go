@@ -68,6 +68,12 @@ var (
 		reservationCapacityExceededErrorCode,
 		capacityReservationStateUnavailableErrorCode,
 	)
+
+	// reservationFullErrorCodes signify that a capacity reservation has no free capacity for another instance
+	reservationFullErrorCodes = sets.New(
+		reservationCapacityExceededErrorCode,
+		"InsufficientInstanceCapacity",
+	)
 )
 
 // IsNotFound returns true if the err is an AWS error (even if it's
@@ -122,6 +128,38 @@ func IgnoreDryRunError(err error) error {
 		return nil
 	}
 	return err
+}
+
+// IsReservationFullError returns whether the error is EC2 refusing to place an instance in a capacity reservation because
+// the reservation has no free capacity.
+func IsReservationFullError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := lo.ErrorsAs[smithy.APIError](err); ok {
+		return reservationFullErrorCodes.Has(apiErr.ErrorCode())
+	}
+	return false
+}
+
+// IsAPIClientError returns whether EC2 responded to the request with an error caused by the request itself, as opposed
+// to a server error or a request that never got a response. EC2 doesn't apply requests it fails this way.
+func IsAPIClientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	apiErr, ok := lo.ErrorsAs[smithy.APIError](err)
+	if !ok || IsServerError(err) || IsRateLimitedError(err) {
+		return false
+	}
+	// EC2's query protocol doesn't set the error fault, so rely on the HTTP status of the response it came with.
+	if response, ok := lo.ErrorsAs[interface {
+		error
+		HTTPStatusCode() int
+	}](err); ok {
+		return response.HTTPStatusCode() >= 400 && response.HTTPStatusCode() < 500
+	}
+	return apiErr.ErrorFault() == smithy.FaultClient
 }
 
 func IsUnauthorizedOperationError(err error) bool {

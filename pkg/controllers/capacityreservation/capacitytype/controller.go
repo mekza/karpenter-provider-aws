@@ -35,17 +35,22 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
+	"github.com/aws/karpenter-provider-aws/pkg/utils"
 )
 
 type Controller struct {
-	cp         cloudprovider.CloudProvider
-	kubeClient client.Client
+	cp               cloudprovider.CloudProvider
+	kubeClient       client.Client
+	instanceProvider instance.Provider
 }
 
-func NewController(kubeClient client.Client, cp cloudprovider.CloudProvider) *Controller {
+func NewController(kubeClient client.Client, cp cloudprovider.CloudProvider, instanceProvider instance.Provider) *Controller {
 	return &Controller{
-		cp:         cp,
-		kubeClient: kubeClient,
+		cp:               cp,
+		kubeClient:       kubeClient,
+		instanceProvider: instanceProvider,
 	}
 }
 
@@ -116,6 +121,25 @@ func (c *Controller) syncCapacityType(ctx context.Context, capacityType string, 
 	// account for on-demand NodeClaims being promoted to reserved since that is not natively supported by Karpenter.
 	if capacityType != karpv1.CapacityTypeOnDemand {
 		return false, nil
+	}
+	// A NodeClaim moving into a capacity reservation is relabeled by the reservation migration controller.
+	if nc.Annotations[karpv1.ReservationMigrationTargetAnnotationKey] != "" {
+		return false, nil
+	}
+	// The capacity type was listed before the NodeClaim, so a NodeClaim that moved into a reservation in between would
+	// look demoted. Confirm against EC2, bypassing the instance cache the listing just populated, before demoting it.
+	if nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {
+		id, err := utils.ParseInstanceID(nc.Status.ProviderID)
+		if err != nil {
+			return false, serrors.Wrap(fmt.Errorf("parsing instance id, %w", err), "NodeClaim", klog.KObj(nc))
+		}
+		current, err := c.instanceProvider.Get(ctx, id, instance.SkipCache)
+		if err != nil {
+			return false, cloudprovider.IgnoreNodeClaimNotFoundError(serrors.Wrap(fmt.Errorf("getting instance, %w", err), "NodeClaim", klog.KObj(nc)))
+		}
+		if current.CapacityType != karpv1.CapacityTypeOnDemand {
+			return false, nil
+		}
 	}
 	updated := false
 	if nc.Labels[karpv1.CapacityTypeLabelKey] == karpv1.CapacityTypeReserved {

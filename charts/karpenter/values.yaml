@@ -278,6 +278,11 @@ settings:
     # Setting this to true will enable Karpenter to manage pod-deletion-cost annotations on ReplicaSet pods on its nodes,
     # so that ReplicaSet scale-down prefers to remove pods from nodes Karpenter wants to consolidate.
     podDeletionCostManagement: false
+    # -- reservedCapacityMigration is ALPHA and is disabled by default.
+    # Setting this to true lets Karpenter move running on-demand nodes into compatible On-Demand Capacity Reservations
+    # with free capacity in place, without replacing them. Requires reservedCapacity and the
+    # ec2:ModifyInstanceCapacityReservationAttributes permission.
+    reservedCapacityMigration: false
   # -- AWS-specific Feature Gate configuration values.
   awsFeatureGates:
     # -- nodeClassCEL is ALPHA and is disabled by default.

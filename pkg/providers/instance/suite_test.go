@@ -27,6 +27,7 @@ import (
 	arczonalshifttypes "github.com/aws/aws-sdk-go-v2/service/arczonalshift/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 	"github.com/awslabs/operatorpkg/object"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -714,6 +715,29 @@ var _ = Describe("InstanceProvider", func() {
 		Expect(nodeClaims[0].Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
 		Expect(nodeClaims[0].Labels).ToNot(HaveKey(v1.LabelCapacityReservationID))
 	})
+	DescribeTable("should classify instances in capacity reservations",
+		func(spec *ec2types.CapacityReservationSpecificationResponse, capacityType string) {
+			ec2Instance := test.EC2Instance(ec2types.Instance{CapacityReservationId: lo.ToPtr("cr-foo"), CapacityReservationSpecification: spec})
+			awsEnv.EC2API.Instances.Store(aws.ToString(ec2Instance.InstanceId), ec2Instance)
+			inst, err := awsEnv.InstanceProvider.Get(ctx, aws.ToString(ec2Instance.InstanceId), instance.SkipCache)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(inst.CapacityType).To(Equal(capacityType))
+		},
+		Entry("as reserved when it can only run in the reservation", &ec2types.CapacityReservationSpecificationResponse{
+			CapacityReservationPreference: ec2types.CapacityReservationPreferenceCapacityReservationsOnly,
+			CapacityReservationTarget:     &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-foo")},
+		}, karpv1.CapacityTypeReserved),
+		Entry("as reserved when it targets the reservation", &ec2types.CapacityReservationSpecificationResponse{
+			CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-foo")},
+		}, karpv1.CapacityTypeReserved),
+		Entry("as on-demand when it landed in an open reservation", &ec2types.CapacityReservationSpecificationResponse{
+			CapacityReservationPreference: ec2types.CapacityReservationPreferenceOpen,
+		}, karpv1.CapacityTypeOnDemand),
+		Entry("as on-demand when it targets another reservation", &ec2types.CapacityReservationSpecificationResponse{
+			CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: lo.ToPtr("cr-bar")},
+		}, karpv1.CapacityTypeOnDemand),
+		Entry("as on-demand without capacity reservation settings", nil, karpv1.CapacityTypeOnDemand),
+	)
 	It("should return all NodePool-owned instances from List", func() {
 		ids := sets.New[string]()
 		// Provision instances that have the karpenter.sh/nodepool key
@@ -1171,6 +1195,122 @@ var _ = Describe("InstanceProvider", func() {
 			Entry("disabled despite an EFA request", false, true, 0),
 		)
 	})
+	Context("MigrateToReservation", func() {
+		const reservationID = "cr-migration"
+		// onDemandInstance stores a running on-demand instance launched with a capacity reservation preference of none.
+		onDemandInstance := func() string {
+			ec2Instance := test.EC2Instance(ec2types.Instance{
+				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{CapacityReservationPreference: ec2types.CapacityReservationPreferenceNone},
+			})
+			awsEnv.EC2API.Instances.Store(aws.ToString(ec2Instance.InstanceId), ec2Instance)
+			return aws.ToString(ec2Instance.InstanceId)
+		}
+		BeforeEach(func() {
+			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount(reservationID, 2)
+		})
+		It("should target the reservation and report the instance as reserved", func() {
+			id := onDemandInstance()
+			Expect(awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)).To(Succeed())
+
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(1))
+			input := awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Pop()
+			Expect(aws.ToString(input.InstanceId)).To(Equal(id))
+			// A running instance can only be moved by targeting the reservation, without changing its preference
+			Expect(input.CapacityReservationSpecification.CapacityReservationPreference).To(BeEmpty())
+			Expect(aws.ToString(input.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId)).To(Equal(reservationID))
+			Expect(input.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationResourceGroupArn).To(BeNil())
+
+			// The cached instance is refreshed, so Get reports the instance in the reservation without another EC2 call
+			awsEnv.EC2API.DescribeInstancesBehavior.CalledWithInput.Reset()
+			inst, err := awsEnv.InstanceProvider.Get(ctx, id)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(awsEnv.EC2API.DescribeInstancesBehavior.CalledWithInput.Len()).To(Equal(0))
+			Expect(inst.CapacityType).To(Equal(karpv1.CapacityTypeReserved))
+			Expect(inst.CapacityReservationDetails).To(Equal(&instance.CapacityReservationDetails{ID: reservationID, Type: v1.CapacityReservationTypeDefault}))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(1))
+		})
+		It("should succeed without modifying an instance that already targets the reservation", func() {
+			id := onDemandInstance()
+			Expect(awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)).To(Succeed())
+			Expect(awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)).To(Succeed())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(1))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(1))
+		})
+		It("should move an instance whose reservation is no longer active", func() {
+			// e.g. an instance launched into a reservation that since expired, and was demoted to on-demand
+			ec2Instance := test.EC2Instance(ec2types.Instance{
+				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationPreference: ec2types.CapacityReservationPreferenceCapacityReservationsOnly,
+					CapacityReservationTarget:     &ec2types.CapacityReservationTargetResponse{CapacityReservationId: aws.String("cr-expired")},
+				},
+			})
+			id := aws.ToString(ec2Instance.InstanceId)
+			awsEnv.EC2API.Instances.Store(id, ec2Instance)
+			Expect(awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)).To(Succeed())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(1))
+			inst, err := awsEnv.InstanceProvider.Get(ctx, id)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(inst.CapacityType).To(Equal(karpv1.CapacityTypeReserved))
+			Expect(inst.CapacityReservationDetails.ID).To(Equal(reservationID))
+		})
+		DescribeTable("should return a NodeClaimNotMigratableError for instances EC2 can't move while they run",
+			func(override ec2types.Instance) {
+				ec2Instance := test.EC2Instance(override)
+				id := aws.ToString(ec2Instance.InstanceId)
+				awsEnv.EC2API.Instances.Store(id, ec2Instance)
+				err := awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)
+				Expect(corecloudprovider.IsNodeClaimNotMigratableError(err)).To(BeTrue())
+				Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(0))
+				Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(2))
+			},
+			Entry("with an open capacity reservation preference", ec2types.Instance{
+				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{CapacityReservationPreference: ec2types.CapacityReservationPreferenceOpen},
+			}),
+			Entry("without capacity reservation settings", ec2types.Instance{}),
+			Entry("for a spot instance", ec2types.Instance{
+				SpotInstanceRequestId:            aws.String("sir-123"),
+				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{CapacityReservationPreference: ec2types.CapacityReservationPreferenceNone},
+			}),
+			Entry("for an instance in another reservation", ec2types.Instance{
+				CapacityReservationId: aws.String("cr-other"),
+				CapacityReservationSpecification: &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationPreference: ec2types.CapacityReservationPreferenceCapacityReservationsOnly,
+					CapacityReservationTarget:     &ec2types.CapacityReservationTargetResponse{CapacityReservationId: aws.String("cr-other")},
+				},
+			}),
+		)
+		It("should stop offering a full reservation when EC2 reports it has no capacity", func() {
+			id := onDemandInstance()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "ReservationCapacityExceeded", Fault: smithy.FaultClient})
+			err := awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)
+			Expect(err).To(HaveOccurred())
+			Expect(corecloudprovider.IsReservationMigrationRejectedError(err)).To(BeTrue())
+			Expect(corecloudprovider.IsNodeClaimNotMigratableError(err)).To(BeFalse())
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(0))
+			inst, err := awsEnv.InstanceProvider.Get(ctx, id)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(inst.CapacityType).To(Equal(karpv1.CapacityTypeOnDemand))
+		})
+		It("should report other rejections without changing the reservation's availability", func() {
+			id := onDemandInstance()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "InvalidParameterValue", Fault: smithy.FaultClient})
+			err := awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)
+			Expect(corecloudprovider.IsReservationMigrationRejectedError(err)).To(BeTrue())
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(2))
+		})
+		It("should not report a request whose outcome is unknown as rejected", func() {
+			id := onDemandInstance()
+			awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.Error.Set(&smithy.GenericAPIError{Code: "InternalError", Fault: smithy.FaultServer})
+			err := awsEnv.InstanceProvider.MigrateToReservation(ctx, id, reservationID)
+			Expect(err).To(HaveOccurred())
+			Expect(corecloudprovider.IsReservationMigrationRejectedError(err)).To(BeFalse())
+		})
+		It("should return a NodeClaimNotFoundError for a missing instance", func() {
+			err := awsEnv.InstanceProvider.MigrateToReservation(ctx, fake.InstanceID(), reservationID)
+			Expect(corecloudprovider.IsNodeClaimNotFoundError(err)).To(BeTrue())
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(0))
+		})
+	})
 	Context("Zonal Shift", func() {
 		var instanceID string
 		BeforeEach(func() {
@@ -1230,6 +1370,13 @@ var _ = Describe("InstanceProvider", func() {
 			Expect(err.Error()).To(ContainSubstring("zonally shifted"))
 			Expect(awsEnv.EC2API.DescribeInstancesBehavior.CalledWithInput.Len()).To(Equal(0))
 			Expect(awsEnv.EC2API.RebootInstancesBehavior.CalledWithInput.Len()).To(Equal(0))
+		})
+		It("should not call ModifyInstanceCapacityReservationAttributes for instances in a zonally shifted AZ", func() {
+			err := awsEnv.InstanceProvider.MigrateToReservation(ctx, instanceID, "cr-migration")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("zonally shifted"))
+			Expect(awsEnv.EC2API.DescribeInstancesBehavior.CalledWithInput.Len()).To(Equal(0))
+			Expect(awsEnv.EC2API.ModifyInstanceCapacityReservationAttributesBehavior.CalledWithInput.Len()).To(Equal(0))
 		})
 		It("should not call CreateTags for instances in a zonally shifted AZ", func() {
 			err := awsEnv.InstanceProvider.CreateTags(ctx, instanceID, map[string]string{"test-key": "test-value"})

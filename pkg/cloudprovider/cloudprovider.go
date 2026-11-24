@@ -318,6 +318,21 @@ func (c *CloudProvider) Reboot(ctx context.Context, nodeClaim *karpv1.NodeClaim,
 	return c.instanceProvider.Reboot(ctx, id, operationID)
 }
 
+// MigrateToReservation moves the running on-demand instance backing the NodeClaim into the offering's capacity
+// reservation in place.
+func (c *CloudProvider) MigrateToReservation(ctx context.Context, nodeClaim *karpv1.NodeClaim, offering *cloudprovider.Offering) error {
+	id, err := utils.ParseInstanceID(nodeClaim.Status.ProviderID)
+	if err != nil {
+		return fmt.Errorf("getting instance ID, %w", err)
+	}
+	reservationID := offering.ReservationID()
+	if offering.CapacityType() != karpv1.CapacityTypeReserved || reservationID == "" {
+		return fmt.Errorf("offering isn't a capacity reservation")
+	}
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("id", id))
+	return c.instanceProvider.MigrateToReservation(ctx, id, reservationID)
+}
+
 func (c *CloudProvider) DisruptionReasons() []karpv1.DisruptionReason {
 	return nil
 }

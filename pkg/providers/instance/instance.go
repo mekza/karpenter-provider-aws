@@ -88,6 +88,9 @@ type Provider interface {
 	List(context.Context) ([]*Instance, error)
 	Delete(context.Context, string) error
 	Reboot(context.Context, string, string) error
+	// MigrateToReservation moves the running instance into the capacity reservation in place. It returns a
+	// NodeClaimNotMigratableError if EC2 can never move the instance into a reservation while it runs.
+	MigrateToReservation(context.Context, string, string) error
 	CreateTags(context.Context, string, map[string]string) error
 }
 
@@ -350,6 +353,77 @@ func (p *DefaultProvider) Reboot(ctx context.Context, id string, operationID str
 		return fmt.Errorf("rebooting instance, %w", err)
 	}
 	return nil
+}
+
+// MigrateToReservation moves the running instance into the capacity reservation in place, by targeting the reservation
+// with ec2:ModifyInstanceCapacityReservationAttributes. EC2 only moves a running instance into a reservation when its
+// capacity reservation preference is none, which is how Karpenter launches on-demand instances when reserved capacity is
+// enabled, or when it targets a reservation that is no longer active, as instances Karpenter launched into a reservation
+// that since expired or was canceled do. Targeting the reservation is what makes the call idempotent: once the
+// instance targets it, the move was accepted and isn't requested again.
+func (p *DefaultProvider) MigrateToReservation(ctx context.Context, id string, reservationID string) error {
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("id", id, "reservation-id", reservationID))
+	instance, err := p.Get(ctx, id, SkipCache)
+	if err != nil {
+		return err
+	}
+	if instance.CapacityReservationTargetID == reservationID {
+		return nil
+	}
+	// Avoid mutating instances during zonal shift
+	if instance.ZoneID != "" && p.zonalshiftProvider.IsZonalShifted(ctx, instance.ZoneID) {
+		return fmt.Errorf("instance %s is in zonally shifted availability zone %s (%s), skipping capacity reservation migration", id, instance.Zone, instance.ZoneID)
+	}
+	if err := migratable(instance); err != nil {
+		return err
+	}
+	_, err = p.ec2api.ModifyInstanceCapacityReservationAttributes(ctx, &ec2.ModifyInstanceCapacityReservationAttributesInput{
+		InstanceId: aws.String(id),
+		CapacityReservationSpecification: &ec2types.CapacityReservationSpecification{
+			CapacityReservationTarget: &ec2types.CapacityReservationTarget{CapacityReservationId: aws.String(reservationID)},
+		},
+	})
+	// Refresh the cached instance either way, so Get reports whether it moved. If the refresh fails, evict the instance
+	// so the next Get reads it from EC2.
+	refreshed, getErr := p.Get(ctx, id, SkipCache)
+	if getErr != nil {
+		p.instanceCache.Delete(id)
+	}
+	// The request may have been applied even though it failed.
+	if err != nil && (getErr != nil || refreshed.CapacityReservationTargetID != reservationID) {
+		return p.migrationError(reservationID, err)
+	}
+	p.capacityReservationProvider.MarkLaunched(reservationID)
+	return nil
+}
+
+// migratable returns a NodeClaimNotMigratableError if EC2 can't move the running instance into a reservation.
+func migratable(instance *Instance) error {
+	if instance.CapacityType != karpv1.CapacityTypeOnDemand {
+		return cloudprovider.NewNodeClaimNotMigratableError(fmt.Errorf("instance %s has capacity type %q, but only on-demand instances can move into a capacity reservation", instance.ID, instance.CapacityType))
+	}
+	// An on-demand instance that targets a reservation doesn't run in it, so the reservation is no longer active.
+	if instance.CapacityReservationTargetID == "" && instance.CapacityReservationPreference != ec2types.CapacityReservationPreferenceNone {
+		return cloudprovider.NewNodeClaimNotMigratableError(fmt.Errorf("instance %s has capacity reservation preference %q, "+
+			"but only running instances with preference %q, or that target an inactive reservation, can move into a capacity reservation",
+			instance.ID, instance.CapacityReservationPreference, ec2types.CapacityReservationPreferenceNone))
+	}
+	return nil
+}
+
+// migrationError classifies an error EC2 returned for a request to move an instance into the reservation, which the
+// instance isn't known to have moved into.
+func (p *DefaultProvider) migrationError(reservationID string, err error) error {
+	if awserrors.IsReservationFullError(err) {
+		// Stop offering the reservation until the next sync corrects its availability, as for a full launch.
+		p.capacityReservationProvider.SetAvailableInstanceCount(reservationID, 0)
+	}
+	// EC2 answered with a client error, so it didn't apply the request. Anything else, like a server error or a lost
+	// response, leaves it unknown.
+	if awserrors.IsAPIClientError(err) {
+		return cloudprovider.NewReservationMigrationRejectedError(fmt.Errorf("migrating instance into capacity reservation, %w", err))
+	}
+	return fmt.Errorf("migrating instance into capacity reservation, %w", err)
 }
 
 func (p *DefaultProvider) CreateTags(ctx context.Context, id string, tags map[string]string) error {

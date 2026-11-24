@@ -683,6 +683,15 @@ func (c *Client) TerminateInstances(_ context.Context, input *ec2.TerminateInsta
 	}, nil
 }
 
+// ModifyInstanceCapacityReservationAttributes is unsupported since KWOK doesn't model capacity reservations. It is
+// overridden so the call never reaches EC2.
+func (c *Client) ModifyInstanceCapacityReservationAttributes(_ context.Context, _ *ec2.ModifyInstanceCapacityReservationAttributesInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
+	return nil, &smithy.GenericAPIError{
+		Code:    "Unsupported",
+		Message: "KWOK doesn't support capacity reservations",
+	}
+}
+
 func (c *Client) DescribeInstances(_ context.Context, input *ec2.DescribeInstancesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
 	<-c.readBackupCompleted
 	if !c.rateLimiterProvider.DescribeInstances().TryAccept() {

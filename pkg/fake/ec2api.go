@@ -76,6 +76,8 @@ type EC2Behavior struct {
 	Subnets                               sync.Map
 	LaunchTemplates                       sync.Map
 	launchTemplatesToCapacityReservations sync.Map // map[lt-name]cr-id
+
+	ModifyInstanceCapacityReservationAttributesBehavior MockedFunction[ec2.ModifyInstanceCapacityReservationAttributesInput, ec2.ModifyInstanceCapacityReservationAttributesOutput]
 }
 
 type EC2API struct {
@@ -105,6 +107,7 @@ func (e *EC2API) Reset() {
 	e.CreateFleetBehavior.Reset()
 	e.TerminateInstancesBehavior.Reset()
 	e.RebootInstancesBehavior.Reset()
+	e.ModifyInstanceCapacityReservationAttributesBehavior.Reset()
 	e.DescribeInstancesBehavior.Reset()
 	e.CreateLaunchTemplateBehavior.Reset()
 	e.CalledWithDescribeImagesInput.Reset()
@@ -277,6 +280,28 @@ func (e *EC2API) RebootInstances(_ context.Context, input *ec2.RebootInstancesIn
 	return e.RebootInstancesBehavior.Invoke(input, func(input *ec2.RebootInstancesInput) (*ec2.RebootInstancesOutput, error) {
 		// A reboot preserves the instance, so unlike TerminateInstances the fake leaves e.Instances intact.
 		return &ec2.RebootInstancesOutput{}, nil
+	})
+}
+
+// ModifyInstanceCapacityReservationAttributes moves the stored instance into the targeted capacity reservation, the way
+// EC2 moves a running instance whose capacity reservation preference is none.
+func (e *EC2API) ModifyInstanceCapacityReservationAttributes(_ context.Context, input *ec2.ModifyInstanceCapacityReservationAttributesInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
+	return e.ModifyInstanceCapacityReservationAttributesBehavior.Invoke(input, func(input *ec2.ModifyInstanceCapacityReservationAttributesInput) (*ec2.ModifyInstanceCapacityReservationAttributesOutput, error) {
+		raw, ok := e.Instances.Load(lo.FromPtr(input.InstanceId))
+		if !ok {
+			return nil, &smithy.GenericAPIError{Code: "InvalidInstanceID.NotFound", Message: "The instance ID does not exist"}
+		}
+		instance := raw.(ec2types.Instance)
+		target := input.CapacityReservationSpecification.CapacityReservationTarget
+		if target == nil || target.CapacityReservationId == nil {
+			return nil, &smithy.GenericAPIError{Code: "InvalidParameterCombination", Message: "A capacity reservation target is required"}
+		}
+		instance.CapacityReservationId = target.CapacityReservationId
+		instance.CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+			CapacityReservationTarget: &ec2types.CapacityReservationTargetResponse{CapacityReservationId: target.CapacityReservationId},
+		}
+		e.Instances.Swap(lo.FromPtr(instance.InstanceId), instance)
+		return &ec2.ModifyInstanceCapacityReservationAttributesOutput{Return: lo.ToPtr(true)}, nil
 	})
 }
 

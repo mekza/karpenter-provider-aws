@@ -86,6 +86,10 @@ func (c *CloudProvider) Reboot(context.Context, *karpv1.NodeClaim, string) error
 	return nil
 }
 
+func (c *CloudProvider) MigrateToReservation(context.Context, *karpv1.NodeClaim, *corecloudprovider.Offering) error {
+	return nil
+}
+
 func (c *CloudProvider) DisruptionReasons() []karpv1.DisruptionReason {
 	return nil
 }

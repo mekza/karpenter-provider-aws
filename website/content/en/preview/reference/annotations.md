@@ -230,4 +230,16 @@ Stability Level: ALPHA
 
 Karpenter sets this to a comma-separated list of the DRA drivers whose devices were allocated to pods scheduled to the NodeClaim. The node is not initialized until each driver has published its ResourceSlices.
 
+### `karpenter.sh/reservation-migration-target`
+
+Type: Annotation
+
+Example: `karpenter.sh/reservation-migration-target: "cr-0123456789abcdef0"`
+
+Used on: NodeClaim
+
+Stability Level: ALPHA
+
+Karpenter sets this to the ID of the capacity reservation it is moving the NodeClaim's running on-demand instance into. While set, the Node stays fenced with the karpenter.sh/reservation-migration taint. Removed when the NodeClaim and Node are relabeled as reserved, or the move is abandoned.
+
 [comment]: <> (end docs generated content from hack/docs/annotations_gen/main.go)
